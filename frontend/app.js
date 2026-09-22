@@ -32,17 +32,47 @@
   }
 
   async function api(path, options = {}) {
-    const res = await fetch(`${API_BASE}${path}`, {
-      headers: { "Content-Type": "application/json" },
-      ...options,
-    });
+    const url = `${API_BASE}${path}`;
+    let res;
+    try {
+      res = await fetch(url, {
+        headers: { "Content-Type": "application/json" },
+        ...options,
+      });
+    } catch (err) {
+      // fetch() throws on CORS blocks, network errors, DNS failures, etc.
+      // The browser never gives JS the real reason for a CORS block, but
+      // it DOES print a detailed CORS error to the console automatically —
+      // so log loudly here and point the dev at it.
+      console.error(`[api] fetch() threw for ${url}`, err);
+      console.error(
+        "[api] If you see a message above starting with " +
+          "\"Access to fetch at ... has been blocked by CORS policy\", " +
+          "this is a CORS problem on the backend, not a bug in this file."
+      );
+      throw new Error(`Network/CORS error reaching ${url}: ${err.message}`);
+    }
+
     if (!res.ok) {
       let detail = res.statusText;
-      try { detail = (await res.json()).detail || detail; } catch (_) {}
-      throw new Error(detail);
+      try {
+        const body = await res.json();
+        detail = body.detail || JSON.stringify(body);
+      } catch (_) {
+        // response wasn't JSON — keep statusText
+      }
+      console.error(`[api] ${res.status} ${res.statusText} for ${url}`, detail);
+      throw new Error(`${res.status} ${detail}`);
     }
+
     if (res.status === 204) return null;
-    return res.json();
+
+    try {
+      return await res.json();
+    } catch (err) {
+      console.error(`[api] response from ${url} was not valid JSON`, err);
+      throw new Error(`Bad JSON from ${url}: ${err.message}`);
+    }
   }
 
   // ---------- user identity ----------
@@ -121,6 +151,7 @@
       const memories = await api(`/memories/${encodeURIComponent(userId)}`);
       renderMemories(memories);
     } catch (err) {
+      console.error("[refreshMemories] failed:", err);
       memoriesList.innerHTML = `<p class="empty">Couldn't load memories.</p>`;
     }
   }
@@ -163,6 +194,7 @@
       const deadlines = await api(`/deadlines/${encodeURIComponent(userId)}`);
       renderDeadlines(deadlines);
     } catch (err) {
+      console.error("[refreshDeadlines] failed:", err);
       deadlinesList.innerHTML = `<p class="empty">Couldn't load deadlines.</p>`;
     }
   }
@@ -201,10 +233,17 @@
       statusBrain.textContent = health.ai || "—";
       statusModel.textContent = health.model || "rule-based";
     } catch (err) {
+      // Previously this swallowed the error entirely, so "offline" gave no
+      // clue why. Now the real cause (CORS, network, bad JSON, etc.) is
+      // logged above by api(), and we surface a short reason in the UI too.
+      console.error("[refreshStatus] failed:", err);
       statusDot.className = "status-dot status-dot--bad";
       statusText.textContent = "offline";
       statusBrain.textContent = "—";
       statusModel.textContent = "—";
+      if (statusText.dataset) {
+        statusText.title = err.message; // hover to see the reason
+      }
     }
   }
 
