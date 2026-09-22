@@ -46,6 +46,13 @@ TELEGRAM_CHAT_ID = os.environ.get(
     ""
 )
 
+# Public base URL of this deployed backend (e.g. https://your-app.up.railway.app)
+# Used to auto-register the Telegram webhook on startup.
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+
+# Optional secret path segment so random internet traffic can't hit the webhook.
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "memoria")
+
 PORT = int(os.environ.get("PORT", 8000))
 
 DB_PATH = os.environ.get("DB_PATH", "memory_bot.db")
@@ -82,6 +89,8 @@ from contextlib import asynccontextmanager
 async def lifespan(app):
 
     task = asyncio.create_task(reminder_loop())
+
+    register_telegram_webhook()
 
     log.info("Memoria backend started")
 
@@ -665,16 +674,17 @@ def extract_facts(user_id: str, message: str):
         log.warning(f"extraction failed: {e}")
 
 
-@app.post("/chat")
-def chat(req: ChatRequest):
+def generate_reply(user_id: str, message: str) -> tuple:
+    """Shared chat pipeline used by both the web /chat endpoint and the
+    Telegram webhook, so both surfaces behave identically."""
 
-    memories, deadlines = fetch_user_context(req.user_id)
+    memories, deadlines = fetch_user_context(user_id)
 
     # try to pull out anything new worth remembering
-    extract_facts(req.user_id, req.message)
+    extract_facts(user_id, message)
 
     # re-fetch in case extraction just added something
-    memories, deadlines = fetch_user_context(req.user_id)
+    memories, deadlines = fetch_user_context(user_id)
 
     if AI_ENABLED:
 
@@ -699,7 +709,7 @@ Rules:
 
         try:
 
-            reply = groq_chat(system_prompt, req.message)
+            reply = groq_chat(system_prompt, message)
 
         except Exception as e:
 
@@ -714,6 +724,14 @@ Rules:
             "but I heard you loud and clear."
         )
 
+    return reply, memories, deadlines
+
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+
+    reply, memories, deadlines = generate_reply(req.user_id, req.message)
+
     return ChatResponse(
         reply=reply,
         memories=[{"key": k, "value": v} for k, v in memories.items()],
@@ -722,16 +740,18 @@ Rules:
 
 
 # ============================================================
-# TELEGRAM REMINDERS
+# TELEGRAM — BOT (incoming chat) + REMINDERS (outgoing)
 # ============================================================
 
-def send_telegram(text: str):
+def send_telegram(text: str, chat_id: Optional[str] = None):
+    """Send a message to a specific Telegram chat. Falls back to the
+    TELEGRAM_CHAT_ID env var if no chat_id is given (kept for backward
+    compatibility with older deployments that only used one fixed chat)."""
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+    target = chat_id or TELEGRAM_CHAT_ID
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("telegram not configured — reminder not sent")
+    if not TELEGRAM_BOT_TOKEN or not target:
+        log.warning("telegram not configured — message not sent")
         return
 
     try:
@@ -740,7 +760,7 @@ def send_telegram(text: str):
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
 
             json={
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": target,
                 "text": text,
             },
 
@@ -753,6 +773,116 @@ def send_telegram(text: str):
     except Exception as e:
 
         log.warning(f"telegram send failed: {e}")
+
+
+def register_telegram_webhook():
+    """Point Telegram at our /telegram/webhook/{secret} endpoint so incoming
+    messages actually reach this backend. Runs once at startup. No-op if
+    TELEGRAM_BOT_TOKEN or PUBLIC_URL is not set."""
+
+    if not TELEGRAM_BOT_TOKEN:
+        log.warning("TELEGRAM_BOT_TOKEN not set — Telegram bot is disabled")
+        return
+
+    if not PUBLIC_URL:
+        log.warning(
+            "PUBLIC_URL not set — skipping Telegram webhook registration. "
+            "Set PUBLIC_URL to this service's public HTTPS URL so the bot can receive messages."
+        )
+        return
+
+    webhook_url = f"{PUBLIC_URL}/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
+
+    try:
+
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+            json={"url": webhook_url},
+            timeout=10,
+        )
+
+        if resp.ok and resp.json().get("ok"):
+            log.info(f"telegram webhook registered at {webhook_url}")
+        else:
+            log.error(f"telegram setWebhook failed: {resp.status_code} {resp.text}")
+
+    except Exception as e:
+
+        log.warning(f"telegram webhook registration failed: {e}")
+
+
+@app.get("/telegram/status")
+def telegram_status():
+    """Quick way to check what Telegram thinks our webhook is, and whether
+    the bot token is valid — hit this in a browser to debug connectivity."""
+
+    if not TELEGRAM_BOT_TOKEN:
+        return {"configured": False, "reason": "TELEGRAM_BOT_TOKEN not set"}
+
+    try:
+        me = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=10
+        ).json()
+
+        webhook_info = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo",
+            timeout=10,
+        ).json()
+
+    except Exception as e:
+        return {"configured": True, "error": str(e)}
+
+    return {
+        "configured": True,
+        "bot": me.get("result"),
+        "webhook": webhook_info.get("result"),
+        "expected_webhook_url": (
+            f"{PUBLIC_URL}/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}" if PUBLIC_URL else None
+        ),
+    }
+
+
+@app.post("/telegram/webhook/{secret}")
+async def telegram_webhook(secret: str, update: dict):
+    """Receives incoming messages from Telegram. Each Telegram chat_id is
+    used directly as the Memoria user_id, so a person's Telegram chat
+    carries its own memories/deadlines, and reminders for those deadlines
+    go straight back to that same chat."""
+
+    if secret != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="not found")
+
+    message = update.get("message") or update.get("edited_message")
+
+    if not message:
+        # non-message updates (reactions, etc.) — nothing to do
+        return {"ok": True}
+
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    text = (message.get("text") or "").strip()
+
+    if not chat_id or not text:
+        return {"ok": True}
+
+    user_id = f"telegram:{chat_id}"
+
+    if text in ("/start", "/help"):
+        send_telegram(
+            "Hi! I'm Memoria 🧠 — tell me things to remember, or deadlines "
+            "like \"submit report due 26 November\", and I'll remind you here.",
+            chat_id=chat_id,
+        )
+        return {"ok": True}
+
+    try:
+        reply, _memories, _deadlines = generate_reply(user_id, text)
+    except Exception as e:
+        log.error(f"telegram webhook chat error: {e}")
+        reply = "My brain hiccuped for a second — could you say that again?"
+
+    send_telegram(reply, chat_id=chat_id)
+
+    return {"ok": True}
 
 
 def check_due_reminders():
@@ -804,8 +934,18 @@ def check_due_reminders():
 
             if now >= fire_at or overdue:
 
+                # Deadlines created via Telegram carry the chat id in their
+                # user_id ("telegram:<chat_id>") — route the reminder back
+                # to that exact chat. Deadlines created via the web board
+                # fall back to the fixed TELEGRAM_CHAT_ID env var, if set.
+                if r["user_id"].startswith("telegram:"):
+                    target_chat_id = r["user_id"].split(":", 1)[1]
+                else:
+                    target_chat_id = TELEGRAM_CHAT_ID
+
                 send_telegram(
-                    f"⏰ Reminder: {r['task']} — due {due.isoformat()}"
+                    f"⏰ Reminder: {r['task']} — due {due.isoformat()}",
+                    chat_id=target_chat_id,
                 )
 
                 conn.execute(
