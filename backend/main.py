@@ -109,14 +109,22 @@ app = FastAPI(
 # ============================================================
 # CORS
 # ============================================================
+# NOTE: allow_origins must list every frontend domain that will call this
+# API from a browser, or the browser will silently block the requests
+# (the API can look "offline" to the frontend even though it's running
+# fine). If your Vercel URL changes between deploys (preview URLs), the
+# allow_origin_regex line below covers any *.vercel.app domain so you
+# don't have to keep updating this list.
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://hen-psi.vercel.app",
+        "https://backe-henna.vercel.app",  # current deployed frontend
+        "https://hen-psi.vercel.app",       # previous/alt frontend, remove if unused
         "http://localhost:3000",
         "http://localhost:5173",
     ],
+    allow_origin_regex=r"https://.*\.vercel\.app",  # covers Vercel preview URLs too
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
