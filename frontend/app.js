@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const API_BASE = "https://memoriaai-production.up.railway.app ";
+  const API_BASE = "https://memoriaai-production-b2c1.up.railway.app";
   const STORAGE_KEY = "memoria_user_id";
 
   // ---------- elements ----------
