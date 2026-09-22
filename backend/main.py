@@ -11,6 +11,7 @@ import sqlite3
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from contextlib import closing
 from typing import Optional
 
@@ -51,6 +52,13 @@ DB_PATH = os.environ.get("DB_PATH", "memory_bot.db")
 
 POLL_SECONDS = 30
 
+# Local timezone for reminders (e.g. "Asia/Karachi", "Asia/Kolkata", "Europe/London")
+LOCAL_TZ = ZoneInfo(os.environ.get("APP_TIMEZONE", "Asia/Karachi"))
+
+# Fire reminders N days before the due date, at this local hour
+REMIND_DAYS_BEFORE = int(os.environ.get("REMIND_DAYS_BEFORE", "1"))
+REMIND_HOUR = int(os.environ.get("REMIND_HOUR", "9"))
+
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
@@ -67,9 +75,25 @@ log = logging.getLogger("memoria")
 # FASTAPI
 # ============================================================
 
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app):
+
+    task = asyncio.create_task(reminder_loop())
+
+    log.info("Memoria backend started")
+
+    yield
+
+    task.cancel()
+
+
 app = FastAPI(
     title="Memoria",
-    version="2.0.0"
+    version="2.0.1",
+    lifespan=lifespan,
 )
 
 
@@ -186,7 +210,7 @@ def root():
     return {
         "name": "Memoria",
         "status": "online",
-        "version": "2.0.0"
+        "version": "2.1.0"
     }
 
 
@@ -452,6 +476,14 @@ def save_deadline(user_id: str, task: str, due_date: str, reminder_time: Optiona
     if not task or not due_date:
         return
 
+    # Never store a deadline we cannot schedule — a bad date silently
+    # meant "never notify".
+    try:
+        datetime.fromisoformat(due_date)
+    except ValueError:
+        log.warning(f"skipping deadline with unparseable due_date: {due_date!r}")
+        return
+
     with closing(get_db()) as conn:
 
         conn.execute(
@@ -494,6 +526,86 @@ def fetch_user_context(user_id: str) -> tuple:
     return memories, deadlines
 
 
+
+# ============================================================
+# DEADLINE REPLACE / CANCEL (handles "postponed", "moved", "cancelled")
+# ============================================================
+
+import difflib
+
+
+def _norm_task(s: str) -> str:
+    s = re.sub(r"[^a-z0-9 ]", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def delete_matching_deadlines(user_id: str, task: str, threshold: float = 0.75) -> int:
+    """Delete deadlines for `user_id` whose task matches `task` (fuzzy).
+    Returns how many rows were deleted."""
+
+    norm = _norm_task(task)
+
+    if not norm:
+        return 0
+
+    with closing(get_db()) as conn:
+
+        rows = conn.execute(
+            "SELECT id, task FROM deadlines WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+
+        to_delete = []
+
+        for r in rows:
+
+            existing = _norm_task(r["task"])
+
+            ratio = difflib.SequenceMatcher(None, norm, existing).ratio()
+
+            # substring match catches rephrasings like
+            # "maths exam" vs "maths exam postponed" (ratio only 0.67)
+            substring = (
+                len(norm) >= 4
+                and len(existing) >= 4
+                and (norm in existing or existing in norm)
+            )
+
+            # strong token overlap catches word reordering
+            new_tokens = set(norm.split())
+            old_tokens = set(existing.split())
+            shared = new_tokens & old_tokens
+            # need >=2 shared words (or identical single-word tasks) —
+            # so "physics exam" and "maths exam" stay separate
+            overlap = (
+                len(shared) >= 2
+                or (new_tokens == old_tokens and len(new_tokens) == 1)
+            )
+
+            if existing == norm or ratio >= threshold or substring or overlap:
+                to_delete.append(r["id"])
+
+        for i in to_delete:
+            conn.execute("DELETE FROM deadlines WHERE id = ?", (i,))
+
+        conn.commit()
+
+    return len(to_delete)
+
+
+def replace_deadline(user_id: str, task: str, due_date: str, reminder_time: Optional[str] = None):
+    """If this task already has a deadline (possibly with an old date),
+    remove the old row first so 'postponed to 26 November' does not leave
+    the 24 November row behind."""
+
+    deleted = delete_matching_deadlines(user_id, task)
+
+    if deleted:
+        log.info(f"replaced {deleted} old deadline(s) for task: {task}")
+
+    save_deadline(user_id, task, due_date, reminder_time)
+
+
 # ============================================================
 # CHAT
 # ============================================================
@@ -502,12 +614,15 @@ EXTRACT_PROMPT = """You extract memories and deadlines from a user message.
 Reply with ONLY a JSON object in this exact shape:
 {
   "memories": {"<short lowercase key>": "<value>", ...},
-  "deadlines": [{"task": "...", "due_date": "YYYY-MM-DD"}, ...]
+  "deadlines": [{"task": "...", "due_date": "YYYY-MM-DD"}, ...],
+  "cancelled": ["<task name>", ...]
 }
 Rules:
-- Only include facts the user explicitly wants remembered (birthdays, preferences, passwords hints, facts about themselves).
+- Only include facts the user explicitly wants remembered (birthdays, preferences, password hints, facts about themselves).
 - Only include deadlines/tasks with a clear due date. Convert dates to YYYY-MM-DD. Use year {year} unless the user says otherwise.
-- If nothing is worth remembering, return {"memories": {}, "deadlines": []}.
+- IMPORTANT: if the user says a deadline moved, was postponed, or its date changed, put that task in "deadlines" with the NEW date. Old dates are removed automatically, so always give the latest date.
+- If the user cancels or deletes a task/reminder, put its name in "cancelled".
+- If nothing is worth remembering, return {"memories": {}, "deadlines": [], "cancelled": []}.
 - No markdown, no explanation, JSON only."""
 
 
@@ -529,12 +644,21 @@ def extract_facts(user_id: str, message: str):
         for key, value in (data.get("memories") or {}).items():
             save_memory(user_id, key, str(value))
 
+        # cancelled tasks: remove their deadlines
+        for t in (data.get("cancelled") or []):
+            n = delete_matching_deadlines(user_id, str(t))
+            if n:
+                log.info(f"cancelled deadline(s) for task: {t}")
+
+        # new/updated deadlines: replace any existing row for the same task
         for dl in (data.get("deadlines") or []):
             due = dl.get("due_date", "")
             task = dl.get("task", "")
-            parsed = parse_date(due) or due
+            parsed = parse_date(due)
             if task and parsed:
-                save_deadline(user_id, task, parsed, dl.get("reminder_time"))
+                replace_deadline(user_id, task, parsed, dl.get("reminder_time"))
+            elif task:
+                log.warning(f"AI returned bad due_date {due!r} for task {task!r} — not saved")
 
     except Exception as e:
 
@@ -606,9 +730,13 @@ def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("telegram not configured — reminder not sent")
+        return
+
     try:
 
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
 
             json={
@@ -619,6 +747,9 @@ def send_telegram(text: str):
             timeout=10,
         )
 
+        if not resp.ok:
+            log.error(f"telegram API error {resp.status_code}: {resp.text}")
+
     except Exception as e:
 
         log.warning(f"telegram send failed: {e}")
@@ -626,7 +757,7 @@ def send_telegram(text: str):
 
 def check_due_reminders():
 
-    now = datetime.now()
+    now = datetime.now(LOCAL_TZ)
 
     with closing(get_db()) as conn:
 
@@ -640,39 +771,49 @@ def check_due_reminders():
 
         for r in rows:
 
-            # remind at reminder_time if set, otherwise at midnight of the due date
+            # parse the due date
+            try:
+                due = datetime.fromisoformat(r["due_date"].strip()).date()
+            except (ValueError, TypeError, AttributeError):
+                log.warning(
+                    f"deadline {r['id']} has bad due_date {r['due_date']!r} — skipped"
+                )
+                continue
+
+            # default: remind REMIND_DAYS_BEFORE days early at REMIND_HOUR local time
+            remind_day = due - timedelta(days=REMIND_DAYS_BEFORE)
+            fire_at = datetime(
+                remind_day.year, remind_day.month, remind_day.day,
+                REMIND_HOUR, 0, tzinfo=LOCAL_TZ,
+            )
+
+            # explicit reminder_time from the user overrides the default
             if r["reminder_time"]:
                 try:
-                    remind_at = datetime.fromisoformat(r["reminder_time"])
-                except ValueError:
-                    remind_at = None
-            else:
-                remind_at = None
+                    rt = datetime.fromisoformat(r["reminder_time"].strip())
+                    if rt.tzinfo is None:
+                        rt = rt.replace(tzinfo=LOCAL_TZ)
+                    fire_at = rt
+                except (ValueError, TypeError, AttributeError):
+                    log.warning(
+                        f"deadline {r['id']} has bad reminder_time {r['reminder_time']!r} — using default"
+                    )
 
-            due = None
-            try:
-                due = datetime.fromisoformat(r["due_date"])
-            except ValueError:
-                pass
+            # also fire if we're already past the due date and still unnotified
+            overdue = now.date() > due
 
-            fire = False
-
-            if remind_at and now >= remind_at:
-                fire = True
-
-            elif due and now.date() >= due.date():
-                fire = True
-
-            if fire:
+            if now >= fire_at or overdue:
 
                 send_telegram(
-                    f"Reminder for {r['user_id']}: {r['task']} (due {r['due_date']})"
+                    f"⏰ Reminder: {r['task']} — due {due.isoformat()}"
                 )
 
                 conn.execute(
                     "UPDATE deadlines SET notified = 1 WHERE id = ?",
                     (r["id"],),
                 )
+
+                log.info(f"fired reminder for deadline {r['id']}: {r['task']}")
 
         conn.commit()
 
@@ -690,14 +831,6 @@ async def reminder_loop():
             log.error(f"reminder loop error: {e}")
 
         await asyncio.sleep(POLL_SECONDS)
-
-
-@app.on_event("startup")
-async def startup():
-
-    asyncio.create_task(reminder_loop())
-
-    log.info("Memoria backend started")
 
 
 # ============================================================
